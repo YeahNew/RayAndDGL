@@ -1,0 +1,259 @@
+# -*- coding: utf-8 -*-
+"""
+@Author: yeahnew
+@Time: 2020/7/6
+@Description: Added sampling GAT implementation in DGL
+"""
+import dgl
+import numpy as np
+import torch as th
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import time
+import argparse
+from dgl.data import RedditDataset
+import tqdm
+from dgl.nn.pytorch import edge_softmax, GATConv
+
+
+# TODO 这里的heads是固定的，可以仿照DGL/gat例子改成list
+class GAT(nn.Module):
+    def __init__(self, in_feats, n_hidden, n_classes, n_layers, n_heads, activation, feat_drop, attn_drop,
+                 negative_slope, residual):
+        super().__init__()
+
+        self.n_layers = n_layers
+        self.activation = activation
+        self.n_hidden = n_hidden
+        self.n_heads = n_heads
+        self.n_classes = n_classes
+        self.convs = nn.ModuleList()
+        # 输入层，pyG中需要自己加残差，DGL的GATConv则直接已经提供了参数
+        self.convs.append(
+            GATConv((in_feats, in_feats), n_hidden, n_heads,
+                    feat_drop, attn_drop, negative_slope, residual, self.activation))
+        # 隐藏层
+        for l in range(1, n_layers - 1):
+            # due to multi-head, the in_dim = num_hidden * num_heads
+            self.convs.append(GATConv(
+                (n_hidden * n_heads, n_hidden * n_heads), n_hidden, n_heads,
+                feat_drop, attn_drop, negative_slope, residual, self.activation))
+        # 输出层，这一层不需要激活函数
+        self.convs.append(GATConv(
+            (n_hidden * n_heads, n_hidden * n_heads), n_classes, n_heads,
+            feat_drop, attn_drop, negative_slope, residual, None))
+
+    def forward(self, blocks, x):
+        h = x
+        for l, (layer, block) in enumerate(zip(self.convs, blocks)):
+            h_dst = h[:block.number_of_dst_nodes()]
+            if l != len(self.convs) - 1:
+                h = layer(block, (h, h_dst)).flatten(1)
+                # 这里是参考pyG中的得来的
+                h = F.dropout(h, p=0.5, training=self.training)
+            else:
+                h = layer(block, (h, h_dst))
+        h = h.mean(1)
+        return h.log_softmax(dim=-1)
+
+    def inference(self, g, x, batch_size, device):
+        """
+        Inference with the GAT model on full neighbors (i.e. without neighbor sampling).
+        g : the entire graph.
+        x : the input of entire node set.
+        The inference code is written in a fashion that it could handle any number of nodes and
+        layers.
+        """
+        # During inference with sampling, multi-layer blocks are very inefficient because
+        # lots of computations in the first few layers are repeated.
+        # Therefore, we compute the representation of all nodes layer by layer.  The nodes
+        # on each layer are of course splitted in batches.
+        # TODO: can we standardize this?
+        for l, layer in enumerate(self.convs):
+            if l < self.n_layers - 1:
+                y = th.zeros(g.number_of_nodes(),
+                             self.n_hidden * self.n_heads if l != len(self.convs) - 1 else self.n_classes)
+            else:
+               
+                y = th.zeros(g.number_of_nodes(), self.n_hidden if l != len(self.convs) - 1 else self.n_classes)
+
+            sampler = dgl.dataloading.MultiLayerFullNeighborSampler(1)
+            dataloader = dgl.dataloading.NodeDataLoader(
+                g,
+                th.arange(g.number_of_nodes()),
+                sampler,
+                batch_size=args.batch_size,
+                shuffle=True,
+                drop_last=False,
+                num_workers=args.num_workers
+            )
+
+            for input_nodes, output_nodes, blocks in tqdm.tqdm(dataloader):
+                block = blocks[0]
+
+                block = block.int().to(device)
+                h = x[input_nodes].to(device)
+                h_dst = x[output_nodes].to(device)
+                if l != len(self.convs) - 1:
+                    h = layer(block, (h, h_dst)).flatten(1)
+                else:
+                    h = layer(block, (h, h_dst)).mean(1)
+                    h = h.log_softmax(dim=-1)
+
+                y[output_nodes] = h.cpu()
+
+            x = y
+        return y
+
+
+
+
+def compute_acc(pred, labels):
+    """
+    Compute the accuracy of prediction given the labels.
+    """
+    return (th.argmax(pred, dim=1) == labels).float().sum() / len(pred)
+
+
+def evaluate(model, g, inputs, labels, train_mask, val_mask, test_mask, batch_size, device):
+    """
+    Evaluate the model on the validation set specified by ``val_mask``.
+    g : The entire graph.
+    inputs : The features of all the nodes.
+    labels : The labels of all the nodes.
+    val_mask : A 0-1 mask indicating which nodes do we actually compute the accuracy for.
+    batch_size : Number of nodes to compute at the same time.
+    device : The GPU device to evaluate on.
+    """
+    model.eval()
+    with th.no_grad():
+        pred = model.inference(g, inputs, batch_size, device)
+    model.train()
+    return (compute_acc(pred[train_mask], labels[train_mask]), compute_acc(pred[val_mask], labels[val_mask]),
+            compute_acc(pred[test_mask], labels[test_mask]))
+
+
+#### Entry point
+def run(args, device, data):
+    # Unpack data
+    in_feats, n_classes, g = data
+    train_nid = th.nonzero(g.ndata['train_mask'], as_tuple=True)[0]
+
+    val_nid = th.nonzero(g.ndata['val_mask'], as_tuple=True)[0]
+    test_nid = th.nonzero(g.ndata['test_mask'], as_tuple=True)[0]
+
+    # Create sampler
+    sampler = dgl.dataloading.MultiLayerNeighborSampler(
+        [int(fanout) for fanout in args.fan_out.split(',')])
+    # Create PyTorch DataLoader for constructing blocks
+    dataloader = dgl.dataloading.NodeDataLoader(
+        g,
+        train_nid,
+        sampler,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=False,
+        num_workers=args.num_workers)
+
+    # Define model and optimizer  注意，这里residual设置为了True
+    model = GAT(in_feats, args.n_hidden, n_classes, args.n_layers,
+                args.n_heads, F.elu, args.feat_drop, args.attn_drop, args.negative_slope, True)
+    model = model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+    # DGL0.5已经不能提前将features和labels加入GPU
+    # Training loop
+    avg = 0
+    iter_tput = []
+    for epoch in range(args.num_epochs):
+        tic = time.time()
+
+        # Loop over the dataloader to sample the computation dependency graph as a list of blocks.
+        for step, (input_nodes, seeds, blocks) in enumerate(dataloader):
+            tic_step = time.time()
+
+            # Load the input features as well as output labels
+            blocks = [block.int().to(device) for block in blocks]
+            batch_inputs = blocks[0].srcdata['features']
+            batch_labels = blocks[-1].dstdata['labels']
+
+            # Compute loss and prediction
+            batch_pred = model(blocks, batch_inputs)
+            loss = F.nll_loss(batch_pred, batch_labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            iter_tput.append(len(seeds) / (time.time() - tic_step))
+            if step % args.log_every == 0:
+                acc = compute_acc(batch_pred, batch_labels)
+                gpu_mem_alloc = th.cuda.max_memory_allocated() / 1000000 if th.cuda.is_available() else 0
+                print('Epoch {:05d} | Step {:05d} | Loss {:.4f} | Train Acc {:.4f} | Speed (samples/sec) {:.4f} | GPU '
+                      '{:.1f} MB'.format(
+                    epoch, step, loss.item(), acc.item(), np.mean(iter_tput[3:]), gpu_mem_alloc))
+
+        toc = time.time()
+        print('Epoch Time(s): {:.4f}'.format(toc - tic))
+
+
+
+
+        if epoch >= 5:
+            avg += toc - tic
+        if epoch % args.eval_every == 0 and epoch != 0:
+            train_acc, val_acc, test_acc = evaluate(model, g, g.ndata['features'], g.ndata['labels'],
+                                                    train_nid, val_nid, test_nid, args.batch_size, device)
+            print(f'Train: {train_acc:.4f}, Val: {val_acc:.4f}, '
+                  f'Test: {test_acc:.4f}')
+
+    print('Avg epoch time: {}'.format(avg / (epoch - 5)))
+
+
+if __name__ == '__main__':
+    argparser = argparse.ArgumentParser("multi-gpu training")
+    argparser.add_argument('--gpu', type=int, default=4,
+                           help="GPU device ID. Use -1 for CPU training")
+    argparser.add_argument('--num-epochs', type=int, default=10)
+    argparser.add_argument('--n-hidden', type=int, default=128)
+    argparser.add_argument('--n-layers', type=int, default=2)
+    argparser.add_argument('--n-heads', type=int, default=4)
+    argparser.add_argument('--fan-out', type=str, default='10,25')
+    argparser.add_argument('--batch-size', type=int, default=1024)
+    argparser.add_argument('--log-every', type=int, default=20)
+    argparser.add_argument('--eval-every', type=int, default=2)
+    argparser.add_argument('--lr', type=float, default=0.001)
+    argparser.add_argument('--feat-drop', type=float, default=0.)
+    argparser.add_argument('--attn-drop', type=float, default=0.)
+    argparser.add_argument('--negative-slope', type=float, default=0.2)
+    argparser.add_argument('--num-workers', type=int, default=4,
+                           help="Number of sampling processes. Use 0 for no extra process.")
+    args = argparser.parse_args()
+
+    if args.gpu >= 0:
+        device = th.device('cuda:%d' % args.gpu)
+    else:
+        device = th.device('cpu')
+
+    # load reddit data
+    data = RedditDataset()
+
+    g = data[0]
+    g.ndata['features'] = g.ndata['feat']
+    g.ndata['labels'] = g.ndata['label']
+
+    in_feats = g.ndata['features'].shape[1]
+    n_classes = data.num_classes
+
+    # add self loop,
+    g = dgl.remove_self_loop(g)
+    g = dgl.add_self_loop(g)
+
+    # Create csr/coo/csc formats before launching training processes
+    g.create_formats_()
+
+    data = in_feats, n_classes, g
+    print("*************device:",device)
+    run(args,device,data)
