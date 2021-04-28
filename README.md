@@ -1,2 +1,2 @@
 # RayAndDGL
-GAT sampling without ray
+GATwithDGL.py: GAT sampling without ray
