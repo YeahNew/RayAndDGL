@@ -256,8 +256,8 @@ class CustomTrainingOperator(TrainingOperator):
         train_acc, val_acc, test_acc = compute_acc(pred[train_nid], labels[train_nid]), \
                                        compute_acc(pred[val_nid], labels[val_nid]),\
                                        compute_acc(pred[test_nid], labels[test_nid])
-        print(f'Train: {1-train_acc:.4f}, Val: {1-val_acc:.4f}, '
-              f'Test: {1-test_acc:.4f}')
+        print(f'Train: {train_acc:.4f}, Val: {val_acc:.4f}, '
+              f'Test: {test_acc:.4f}')
 
         status = meter_collection.summary()
         return status
