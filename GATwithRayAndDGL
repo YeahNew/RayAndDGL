@@ -164,14 +164,11 @@ class CustomTrainingOperator(TrainingOperator):
         # Define optimizer.
         optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
 
-        # Create loss.
-        loss = torch.nn.MSELoss()
 
         # Register model, optimizer, and loss.
-        self.model, self.optimizer, self.criterion = self.register(
+        self.model, self.optimizer = self.register(
             models=self.model,
-            optimizers=optimizer,
-            criterion=loss)
+            optimizers=optimizer)
 
         # Register data loaders.
         self.register_data(train_loader=train_dataloader,
