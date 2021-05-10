@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-@Author: yeahnew
+@Author: yexin
 @Time: 2020/7/6
 @Description: Added sampling GAT implementation in DGL
 """
@@ -17,8 +17,6 @@ from dgl.data import RedditDataset
 import tqdm
 from dgl.nn.pytorch import edge_softmax, GATConv
 
-
-# TODO 这里的heads是固定的，可以仿照DGL/gat例子改成list
 class GAT(nn.Module):
     def __init__(self, in_feats, n_hidden, n_classes, n_layers, n_heads, activation, feat_drop, attn_drop,
                  negative_slope, residual):
@@ -30,17 +28,17 @@ class GAT(nn.Module):
         self.n_heads = n_heads
         self.n_classes = n_classes
         self.convs = nn.ModuleList()
-        # 输入层，pyG中需要自己加残差，DGL的GATConv则直接已经提供了参数
+
         self.convs.append(
             GATConv((in_feats, in_feats), n_hidden, n_heads,
                     feat_drop, attn_drop, negative_slope, residual, self.activation))
-        # 隐藏层
+
         for l in range(1, n_layers - 1):
             # due to multi-head, the in_dim = num_hidden * num_heads
             self.convs.append(GATConv(
                 (n_hidden * n_heads, n_hidden * n_heads), n_hidden, n_heads,
                 feat_drop, attn_drop, negative_slope, residual, self.activation))
-        # 输出层，这一层不需要激活函数
+
         self.convs.append(GATConv(
             (n_hidden * n_heads, n_hidden * n_heads), n_classes, n_heads,
             feat_drop, attn_drop, negative_slope, residual, None))
@@ -51,7 +49,7 @@ class GAT(nn.Module):
             h_dst = h[:block.number_of_dst_nodes()]
             if l != len(self.convs) - 1:
                 h = layer(block, (h, h_dst)).flatten(1)
-                # 这里是参考pyG中的得来的
+
                 h = F.dropout(h, p=0.5, training=self.training)
             else:
                 h = layer(block, (h, h_dst))
@@ -157,13 +155,11 @@ def run(args, device, data):
         drop_last=False,
         num_workers=args.num_workers)
 
-    # Define model and optimizer  注意，这里residual设置为了True
     model = GAT(in_feats, args.n_hidden, n_classes, args.n_layers,
                 args.n_heads, F.elu, args.feat_drop, args.attn_drop, args.negative_slope, True)
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    # DGL0.5已经不能提前将features和labels加入GPU
     # Training loop
     avg = 0
     iter_tput = []
