@@ -1,0 +1,411 @@
+# -*- coding: utf-8 -*-
+"""
+@Author: maqingyun and yexin
+@Time: 2020/7/27
+@Description:
+"""
+import math
+import dgl
+import numpy as np
+import torch as th
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel
+import time
+import argparse
+from dgl.data import RedditDataset
+from dgl.nn.pytorch import GATConv
+
+import torch.multiprocessing as mp
+from _thread import start_new_thread
+from functools import wraps
+import traceback
+def thread_wrapped_func(func):
+    """
+    Wraps a process entry point to make it work with OpenMP.
+    """
+
+    @wraps(func)
+    def decorated_function(*args, **kwargs):
+        queue = mp.Queue()
+
+        def _queue_result():
+            exception, trace, res = None, None, None
+            try:
+                res = func(*args, **kwargs)
+            except Exception as e:
+                exception = e
+                trace = traceback.format_exc()
+            queue.put((res, exception, trace))
+
+        start_new_thread(_queue_result, ())
+        result, exception, trace = queue.get()
+        if exception is None:
+            return result
+        else:
+            assert isinstance(exception, Exception)
+            raise exception.__class__(trace)
+
+    return decorated_function
+
+
+class EarlyStopping:
+    def __init__(self, patience=10):
+        self.patience = patience
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+
+    def step(self, acc, model):
+        score = acc
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(model)
+        elif score < self.best_score:
+            self.counter += 1
+            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(model)
+            self.counter = 0
+        return self.early_stop
+
+    def save_checkpoint(self, model):
+        '''Saves model when validation loss decrease.'''
+        th.save(model.state_dict(), 'es_checkpoint.pt')
+
+class GAT(nn.Module):
+    def __init__(self, in_feats, n_hidden, n_classes, n_layers, n_heads, activation, feat_drop, attn_drop,
+                 negative_slope, residual):
+        super().__init__()
+
+        self.n_layers = n_layers
+        self.activation = activation
+        self.n_hidden = n_hidden
+        self.n_heads = n_heads
+        self.n_classes = n_classes
+        self.convs = nn.ModuleList()
+
+        self.convs.append(
+            GATConv((in_feats, in_feats), n_hidden, n_heads,
+                    feat_drop, attn_drop, negative_slope, residual, self.activation))
+
+        for l in range(1, n_layers - 1):
+            # due to multi-head, the in_dim = num_hidden * num_heads
+            self.convs.append(GATConv(
+                (n_hidden * n_heads, n_hidden * n_heads), n_hidden, n_heads,
+                feat_drop, attn_drop, negative_slope, residual, self.activation))
+
+        self.convs.append(GATConv(
+            (n_hidden * n_heads, n_hidden * n_heads), n_classes, n_heads,
+            feat_drop, attn_drop, negative_slope, residual, None))
+
+    def forward(self, blocks, x):
+        h = x
+        for l, (layer, block) in enumerate(zip(self.convs, blocks)):
+            h_dst = h[:block.number_of_dst_nodes()]
+            if l != len(self.convs) - 1:
+                h = layer(block, (h, h_dst)).flatten(1)
+                # 这里是参考pyG中的得来的
+                h = F.dropout(h, p=0.5, training=self.training)
+            else:
+                h = layer(block, (h, h_dst))
+        h = h.mean(1)
+        return h.log_softmax(dim=-1)
+
+    def inference(self, g, x, batch_size, device):
+        """
+        Inference with the GAT model on full neighbors (i.e. without neighbor sampling).
+        g : the entire graph.
+        x : the input of entire node set.
+        The inference code is written in a fashion that it could handle any number of nodes and
+        layers.
+        """
+        # During inference with sampling, multi-layer blocks are very inefficient because
+        # lots of computations in the first few layers are repeated.
+        # Therefore, we compute the representation of all nodes layer by layer.  The nodes
+        # on each layer are of course splitted in batches.
+        # TODO: can we standardize this?
+        for l, layer in enumerate(self.convs):
+            if l < self.n_layers - 1:
+                y = th.zeros(g.number_of_nodes(),
+                             self.n_hidden * self.n_heads if l != len(self.convs) - 1 else self.n_classes)
+            else:
+                # 这里参考的是official_products_gat_sample，但似乎实际没用用到
+                y = th.zeros(g.number_of_nodes(), self.n_hidden if l != len(self.convs) - 1 else self.n_classes)
+
+            sampler = dgl.dataloading.MultiLayerFullNeighborSampler(1)
+            dataloader = dgl.dataloading.NodeDataLoader(
+                g,
+                th.arange(g.number_of_nodes()),
+                sampler,
+                batch_size=args.batch_size,
+                shuffle=True,
+                drop_last=False,
+                num_workers=args.num_workers
+            )
+
+            for input_nodes, output_nodes, blocks in dataloader:
+                block = blocks[0]
+
+                block = block.int().to(device)
+                h = x[input_nodes].to(device)
+                h_dst = x[output_nodes].to(device)
+                if l != len(self.convs) - 1:
+                    h = layer(block, (h, h_dst)).flatten(1)
+                else:
+                    h = layer(block, (h, h_dst)).mean(1)
+                    h = h.log_softmax(dim=-1)
+
+                y[output_nodes] = h.cpu()
+
+            x = y
+        return y
+
+
+def prepare_mp(g):
+    """
+    Explicitly materialize the CSR, CSC and COO representation of the given graph
+    so that they could be shared via copy-on-write to sampler workers and GPU
+    trainers.
+    This is a workaround before full shared memory support on heterogeneous graphs.
+    """
+    g.in_degree(0)
+    g.out_degree(0)
+    g.find_edges([0])
+
+
+def compute_acc(pred, labels):
+    """
+    Compute the accuracy of prediction given the labels.
+    """
+    return (th.argmax(pred, dim=1) == labels).float().sum() / len(pred)
+
+
+def evaluate(model, g, inputs, labels, train_mask, val_mask, test_mask, batch_size, device):
+    """
+    Evaluate the model on the validation set specified by ``val_mask``.
+    g : The entire graph.
+    inputs : The features of all the nodes.
+    labels : The labels of all the nodes.
+    val_mask : A 0-1 mask indicating which nodes do we actually compute the accuracy for.
+    batch_size : Number of nodes to compute at the same time.
+    device : The GPU device to evaluate on.
+    """
+    model.eval()
+    with th.no_grad():
+        pred = model.inference(g, inputs, batch_size, device)
+    model.train()
+    return (compute_acc(pred[train_mask], labels[train_mask]), compute_acc(pred[val_mask], labels[val_mask]),
+            compute_acc(pred[test_mask], labels[test_mask]))
+
+
+def show_memory(unit='GB', threshold=1):
+    from sys import getsizeof
+    scale = {'B': 1, 'KB': 1024, 'MB': 1048576, 'GB': 1073741824}[unit]
+    for i in list(globals().keys()):
+        memory = eval("getsizeof({})".format(i)) // scale
+        if memory > threshold:
+            print(i, memory)
+
+
+#### Entry point
+def run(proc_id, n_gpus, args, devices, data):
+    # Start up distributed training, if enabled.
+    dev_id = devices[proc_id]
+    # number of all gpus/processes
+    world_size = args.nodes * n_gpus
+    # current process's rank
+    rank = args.nr * n_gpus + proc_id
+    if n_gpus > 1 or args.nodes > 1:
+        dist_init_method = 'tcp://{master_ip}:{master_port}'.format(
+            master_ip=args.master_ip, master_port=args.master_port)
+        th.distributed.init_process_group(backend=args.dist_backend,
+                                          init_method=dist_init_method,
+                                          world_size=world_size,
+                                          rank=rank)
+    th.cuda.set_device(dev_id)
+
+    # Unpack data
+    in_feats, n_classes, g = data
+    train_nid = th.nonzero(g.ndata['train_mask'], as_tuple=True)[0]
+    val_nid = th.nonzero(g.ndata['val_mask'], as_tuple=True)[0]
+    test_nid = th.nonzero(g.ndata['test_mask'], as_tuple=True)[0]
+
+    # Split trian_id
+    train_nid = th.split(train_nid, math.ceil(len(train_nid) / world_size))[rank]
+
+    th.cuda.synchronize()
+    start_time1 = time.time()
+    # Create sampler
+    sampler = dgl.dataloading.MultiLayerNeighborSampler(
+        [int(fanout) for fanout in args.fan_out.split(',')])
+    # Create PyTorch DataLoader for constructing blocks
+    dataloader = dgl.dataloading.NodeDataLoader(
+        g,
+        train_nid,
+        sampler,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=False,
+        num_workers=args.num_workers)
+
+    th.cuda.synchronize()
+    print("load data time=", time.time() - start_time1)
+
+    model = GAT(in_feats, args.n_hidden, n_classes, args.n_layers,
+                args.n_heads, F.elu, args.feat_drop, args.attn_drop, args.negative_slope, True)
+    model = model.to(dev_id)
+    if n_gpus > 1 or args.nodes > 1:
+        model = DistributedDataParallel(model, device_ids=[dev_id])
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+    # Training loop
+    avg = 0
+    iter_tput = []
+
+    for epoch in range(args.num_epochs):
+        tic = time.time()
+        totaltime = 0
+        j = 0
+        # Loop over the dataloader to sample the computation dependency graph as a list of blocks.
+        start_time2 = time.time()
+        for step, (input_nodes, seeds, blocks) in enumerate(dataloader):
+            start_time1 = time.time()
+            if rank == 0:
+                tic_step = time.time()
+            j += 1
+            blocks = [block.int().to(dev_id) for block in blocks]
+            batch_inputs = blocks[0].srcdata['features']
+            batch_labels = blocks[-1].dstdata['labels']
+
+            # Compute loss and prediction
+            batch_pred = model(blocks, batch_inputs)
+            loss = F.nll_loss(batch_pred, batch_labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            totaltime += time.time() - start_time1
+
+
+            if rank == 0:
+                iter_tput.append(len(seeds) * n_gpus / (time.time() - tic_step))
+
+
+            if step % args.log_every == 0 and rank == 0:
+                acc = compute_acc(batch_pred, batch_labels)
+                gpu_mem_alloc = th.cuda.max_memory_allocated() / 1000000 if th.cuda.is_available() else 0
+                print('Epoch {:05d} | Step {:05d} | Loss {:.4f} | Train Acc {:.4f} | Speed (samples/sec) {:.4f} | GPU '
+                      '{:.1f} MiB'.format(
+                    epoch, step, loss.item(), acc.item(), np.mean(iter_tput[3:]), gpu_mem_alloc))
+
+        print("avg check time=", totaltime/j)
+        print("batch-num:", j)
+        print("each train time=", time.time() - start_time2)
+
+
+
+
+        if n_gpus > 1 or args.nodes > 1:
+            th.distributed.barrier()
+
+        toc = time.time()
+        if rank == 0:
+            #print('Epoch Time(s): {:.4f}'.format(toc - tic))
+            avg += toc - tic
+            if epoch % args.eval_every == 0 and epoch != 0:
+                if n_gpus == 1:
+                    train_acc, val_acc, test_acc = evaluate(model, g, g.ndata['features'], g.ndata['labels'],
+                                                            train_nid, val_nid, test_nid, args.eval_batch_size,
+                                                            devices[0])
+                else:
+                    train_acc, val_acc, test_acc = evaluate(model.module, g, g.ndata['features'], g.ndata['labels'],
+                                                            train_nid, val_nid, test_nid, args.eval_batch_size,
+                                                            devices[0])
+                print(f'Train: {train_acc:.4f}, Val: {val_acc:.4f}, Test: {test_acc:.4f}')
+
+    if n_gpus > 1 or args.nodes > 1:
+        th.distributed.barrier()
+
+    # if proc_id == 0:
+    #     print('Avg epoch time: {:.2f} s'.format(avg / (epoch + 1)))
+    #     print('Total train time: {:.2f} s'.format(avg))
+
+
+def print_memory_usage():
+    import os
+    import psutil
+    process = psutil.Process(os.getpid())
+    print("memory usage is {} GB".format(process.memory_info()[0] / 1024 / 1024 / 1024))
+
+
+if __name__ == '__main__':
+    # os.environ['NCCL_DEBUG'] = 'INFO'
+    # os.environ['NCCL_SOCKET_IFNAME'] = 'eno4'
+    argparser = argparse.ArgumentParser("multi-gpu training")
+    argparser.add_argument('--gpu', type=str, default='0',
+                           help="Comma separated list of GPU device IDs in each nodes.")
+    argparser.add_argument('--nodes', type=int, default=1,
+                           help="number of nodes for training")
+    argparser.add_argument('--nr', type=int, default=0,
+                           help="current nodes rank")
+    argparser.add_argument('--num-epochs', type=int, default=11)
+    argparser.add_argument('--n-hidden', type=int, default=128)
+    argparser.add_argument('--n-layers', type=int, default=2)
+    argparser.add_argument('--n-heads', type=int, default=4)
+    argparser.add_argument('--fan-out', type=str, default='10,25')
+    argparser.add_argument('--batch-size', type=int, default=1024)
+    argparser.add_argument('--eval-batch-size', type=int, default=1024)
+    argparser.add_argument('--log-every', type=int, default=20)
+    argparser.add_argument('--eval-every', type=int, default=10)
+    argparser.add_argument('--lr', type=float, default=0.001)
+    argparser.add_argument('--feat-drop', type=float, default=0.)
+    argparser.add_argument('--attn-drop', type=float, default=0.)
+    argparser.add_argument('--negative-slope', type=float, default=0.2)
+    argparser.add_argument('--num-workers', type=int, default=0,
+                           help="Number of sampling processes. Use 0 for no extra process.")
+    argparser.add_argument('--master-ip', type=str, default='10.3.68.117')
+    argparser.add_argument('--master-port', type=str, default='12346')
+    argparser.add_argument('--dist-backend', type=str, default='nccl')
+
+    args = argparser.parse_args()
+
+    devices = list(map(int, args.gpu.split(',')))
+    n_gpus = len(devices)
+
+    # load reddit data
+    data = RedditDataset()
+    g = data[0]
+    g.ndata['features'] = g.ndata['feat']
+    g.ndata['labels'] = g.ndata['label']
+
+    in_feats = g.ndata['features'].shape[1]
+    n_classes = data.num_classes
+
+    # add self loop,
+    g = dgl.remove_self_loop(g)
+    g = dgl.add_self_loop(g)
+
+    # Create csr/coo/csc formats before launching training processes
+    g.create_formats_()
+
+    data = in_feats, n_classes, g
+
+    if n_gpus == 1:
+        run(0, n_gpus, args, devices, data)
+    else:
+        # mp.spawn(run, args=(n_gpus, args, devices, data), nprocs=n_gpus)
+        # mp.set_start_method("spawn")
+        procs = []
+        for proc_id in range(n_gpus):
+            p = mp.Process(target=thread_wrapped_func(run),
+                           args=(proc_id, n_gpus, args, devices, data))
+            p.start()
+            procs.append(p)
+
+        for p in procs:
+            p.join()
